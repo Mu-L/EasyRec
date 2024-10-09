@@ -4,13 +4,9 @@ import logging
 from collections import OrderedDict
 
 import tensorflow as tf
-from google.protobuf import struct_pb2
-from tensorflow.python.keras.layers import Dense
 
 from easy_rec.python.builders import loss_builder
 from easy_rec.python.layers.dnn import DNN
-from easy_rec.python.layers.keras.attention import Attention
-from easy_rec.python.layers.utils import Parameter
 from easy_rec.python.model.rank_model import RankModel
 from easy_rec.python.protos import tower_pb2
 from easy_rec.python.protos.easy_rec_model_pb2 import EasyRecModel
@@ -42,6 +38,8 @@ class MultiTaskModel(RankModel):
     model = self._model_config.WhichOneof('model')
     assert model == 'model_params', '`model_params` must be configured'
     config = self._model_config.model_params
+    for out in config.outputs:
+      self._outputs.append(out)
 
     self._init_towers(config.task_towers)
 
@@ -57,65 +55,45 @@ class MultiTaskModel(RankModel):
     tower_features = {}
     for i, task_tower_cfg in enumerate(config.task_towers):
       tower_name = task_tower_cfg.tower_name
-      if task_tower_cfg.HasField('dnn'):
-        tower_dnn = DNN(
-            task_tower_cfg.dnn,
-            self._l2_reg,
-            name=tower_name,
-            is_training=self._is_training)
-        tower_output = tower_dnn(task_input_list[i])
-      else:
-        tower_output = task_input_list[i]
-      tower_features[tower_name] = tower_output
+      with tf.name_scope(tower_name):
+        if task_tower_cfg.HasField('dnn'):
+          tower_dnn = DNN(
+              task_tower_cfg.dnn,
+              self._l2_reg,
+              name=tower_name,
+              is_training=self._is_training)
+          tower_output = tower_dnn(task_input_list[i])
+        else:
+          tower_output = task_input_list[i]
+        tower_features[tower_name] = tower_output
 
     tower_outputs = {}
     relation_features = {}
     # bayes network
     for task_tower_cfg in config.task_towers:
       tower_name = task_tower_cfg.tower_name
-      if task_tower_cfg.HasField('relation_dnn'):
-        relation_dnn = DNN(
-            task_tower_cfg.relation_dnn,
-            self._l2_reg,
-            name=tower_name + '/relation_dnn',
-            is_training=self._is_training)
-        tower_inputs = [tower_features[tower_name]]
-        for relation_tower_name in task_tower_cfg.relation_tower_names:
-          tower_inputs.append(relation_features[relation_tower_name])
-        relation_input = tf.concat(
-            tower_inputs, axis=-1, name=tower_name + '/relation_input')
-        relation_fea = relation_dnn(relation_input)
-        relation_features[tower_name] = relation_fea
-      elif task_tower_cfg.use_ait_module:
-        tower_inputs = [tower_features[tower_name]]
-        for relation_tower_name in task_tower_cfg.relation_tower_names:
-          tower_inputs.append(relation_features[relation_tower_name])
-        if len(tower_inputs) == 1:
-          relation_fea = tower_inputs[0]
+      with tf.name_scope(tower_name):
+        if task_tower_cfg.HasField('relation_dnn'):
+          relation_dnn = DNN(
+              task_tower_cfg.relation_dnn,
+              self._l2_reg,
+              name=tower_name + '/relation_dnn',
+              is_training=self._is_training)
+          tower_inputs = [tower_features[tower_name]]
+          for relation_tower_name in task_tower_cfg.relation_tower_names:
+            tower_inputs.append(relation_features[relation_tower_name])
+          relation_input = tf.concat(
+              tower_inputs, axis=-1, name=tower_name + '/relation_input')
+          relation_fea = relation_dnn(relation_input)
           relation_features[tower_name] = relation_fea
         else:
-          if task_tower_cfg.HasField('ait_project_dim'):
-            dim = task_tower_cfg.ait_project_dim
-          else:
-            dim = int(tower_inputs[0].shape[-1])
-          queries = tf.stack([Dense(dim)(x) for x in tower_inputs], axis=1)
-          keys = tf.stack([Dense(dim)(x) for x in tower_inputs], axis=1)
-          values = tf.stack([Dense(dim)(x) for x in tower_inputs], axis=1)
-          st_params = struct_pb2.Struct()
-          st_params.update({'scale_by_dim': True})
-          params = Parameter(st_params, True)
-          attention_layer = Attention(params, name='AITM_%s' % tower_name)
-          result = attention_layer([queries, values, keys])
-          relation_fea = result[:, 0, :]
-          relation_features[tower_name] = relation_fea
-      else:
-        relation_fea = tower_features[tower_name]
+          relation_fea = tower_features[tower_name]
 
-      output_logits = tf.layers.dense(
-          relation_fea,
-          task_tower_cfg.num_class,
-          kernel_regularizer=self._l2_reg,
-          name=tower_name + '/output')
+        output_logits = tf.layers.dense(
+            relation_fea,
+            task_tower_cfg.num_class,
+            kernel_regularizer=self._l2_reg,
+            name=tower_name + '/output')
       tower_outputs[tower_name] = output_logits
 
     self._add_to_prediction_dict(tower_outputs)
@@ -187,10 +165,12 @@ class MultiTaskModel(RankModel):
       losses = task_tower_cfg.losses
       n = len(losses)
       if n > 0:
-        loss_weights[tower_name] = [loss.weight for loss in losses]
+        loss_weights[tower_name] = [
+            loss.weight * task_tower_cfg.weight for loss in losses
+        ]
         num_loss += n
       else:
-        loss_weights[tower_name] = [1.0]
+        loss_weights[tower_name] = [task_tower_cfg.weight]
         num_loss += 1
 
     strategy = self._base_model_config.loss_weight_strategy
@@ -223,7 +203,7 @@ class MultiTaskModel(RankModel):
     task_loss_weights = self.build_loss_weight()
     for task_tower_cfg in self._task_towers:
       tower_name = task_tower_cfg.tower_name
-      loss_weight = task_tower_cfg.weight
+      loss_weight = 1.0
       if task_tower_cfg.use_sample_weight:
         loss_weight *= self._sample_weight
 
@@ -231,6 +211,16 @@ class MultiTaskModel(RankModel):
           task_tower_cfg.HasField('task_space_indicator_label'):
         in_task_space = tf.to_float(
             self._labels[task_tower_cfg.task_space_indicator_label] > 0)
+        loss_weight = loss_weight * (
+            task_tower_cfg.in_task_space_weight * in_task_space +
+            task_tower_cfg.out_task_space_weight * (1 - in_task_space))
+
+      if task_tower_cfg.HasField('task_space_indicator_name') and \
+          task_tower_cfg.HasField('task_space_indicator_value'):
+        in_task_space = tf.to_float(
+            tf.equal(
+                self._feature_dict[task_tower_cfg.task_space_indicator_name],
+                task_tower_cfg.task_space_indicator_value))
         loss_weight = loss_weight * (
             task_tower_cfg.in_task_space_weight * in_task_space +
             task_tower_cfg.out_task_space_weight * (1 - in_task_space))
@@ -284,13 +274,15 @@ class MultiTaskModel(RankModel):
       self._loss_dict.update(loss_dict)
 
     kd_loss_dict = loss_builder.build_kd_loss(self.kd, self._prediction_dict,
-                                              self._labels)
+                                              self._labels, self._feature_dict)
     self._loss_dict.update(kd_loss_dict)
 
     return self._loss_dict
 
   def get_outputs(self):
     outputs = []
+    if self._outputs:
+      outputs.extend(self._outputs)
     for task_tower_cfg in self._task_towers:
       tower_name = task_tower_cfg.tower_name
       if len(task_tower_cfg.losses) == 0:

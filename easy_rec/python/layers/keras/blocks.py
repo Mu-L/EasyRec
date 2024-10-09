@@ -32,6 +32,7 @@ class MLP(Layer):
 
   def __init__(self, params, name='mlp', reuse=None, **kwargs):
     super(MLP, self).__init__(name=name, **kwargs)
+    self.layer_name = name  # for add to output
     params.check_required('hidden_units')
     use_bn = params.get_or_default('use_bn', True)
     use_final_bn = params.get_or_default('use_final_bn', True)
@@ -50,6 +51,7 @@ class MLP(Layer):
          final_activation, use_bias, initializer, use_bn_after_act))
     assert len(units) > 0, 'MLP(%s) takes at least one hidden units' % name
     self.reuse = reuse
+    self.add_to_outputs = params.get_or_default('add_to_outputs', False)
 
     num_dropout = len(dropout_rate)
     self._sub_layers = []
@@ -77,14 +79,14 @@ class MLP(Layer):
                      use_bn_after_activation,
                      name,
                      l2_reg=None):
-    act_layer = activation_layer(activation)
+    act_layer = activation_layer(activation, name='%s/act' % name)
     if use_bn and not use_bn_after_activation:
       dense = Dense(
           units=num_units,
           use_bias=use_bias,
           kernel_initializer=initializer,
           kernel_regularizer=l2_reg,
-          name=name)
+          name='%s/dense' % name)
       self._sub_layers.append(dense)
       bn = tf.keras.layers.BatchNormalization(
           name='%s/bn' % name, trainable=True)
@@ -96,7 +98,7 @@ class MLP(Layer):
           use_bias=use_bias,
           kernel_initializer=initializer,
           kernel_regularizer=l2_reg,
-          name=name)
+          name='%s/dense' % name)
       self._sub_layers.append(dense)
       self._sub_layers.append(act_layer)
       if use_bn and use_bn_after_activation:
@@ -115,17 +117,21 @@ class MLP(Layer):
       cls = layer.__class__.__name__
       if cls in ('Dropout', 'BatchNormalization', 'Dice'):
         x = layer(x, training=training)
-        if cls in ('BatchNormalization', 'Dice'):
+        if cls in ('BatchNormalization', 'Dice') and training:
           add_elements_to_collection(layer.updates, tf.GraphKeys.UPDATE_OPS)
       else:
         x = layer(x)
+    if self.add_to_outputs and 'prediction_dict' in kwargs:
+      outputs = kwargs['prediction_dict']
+      outputs[self.layer_name] = tf.squeeze(x, axis=1)
+      logging.info('add `%s` to model outputs' % self.layer_name)
     return x
 
 
 class Highway(Layer):
 
   def __init__(self, params, name='highway', reuse=None, **kwargs):
-    super(Highway, self).__init__(name, **kwargs)
+    super(Highway, self).__init__(name=name, **kwargs)
     self.emb_size = params.get_or_default('emb_size', None)
     self.num_layers = params.get_or_default('num_layers', 1)
     self.activation = params.get_or_default('activation', 'relu')
@@ -175,10 +181,16 @@ class Gate(Layer):
   """Weighted sum gate."""
 
   def __init__(self, params, name='gate', reuse=None, **kwargs):
-    super(Gate, self).__init__(name, **kwargs)
+    super(Gate, self).__init__(name=name, **kwargs)
     self.weight_index = params.get_or_default('weight_index', 0)
+    if params.has_field('mlp'):
+      mlp_cfg = Parameter.make_from_pb(params.mlp)
+      mlp_cfg.l2_regularizer = params.l2_regularizer
+      self.top_mlp = MLP(mlp_cfg, name='top_mlp')
+    else:
+      self.top_mlp = None
 
-  def call(self, inputs, **kwargs):
+  def call(self, inputs, training=None, **kwargs):
     assert len(
         inputs
     ) > 1, 'input of Gate layer must be a list containing at least 2 elements'
@@ -192,6 +204,8 @@ class Gate(Layer):
       else:
         output += weights[:, j, None] * x
       j += 1
+    if self.top_mlp is not None:
+      output = self.top_mlp(output, training=training)
     return output
 
 
@@ -203,7 +217,7 @@ class TextCNN(Layer):
   """
 
   def __init__(self, params, name='text_cnn', reuse=None, **kwargs):
-    super(TextCNN, self).__init__(name, **kwargs)
+    super(TextCNN, self).__init__(name=name, **kwargs)
     self.config = params.get_pb_config()
     self.pad_seq_length = self.config.pad_sequence_length
     if self.pad_seq_length <= 0:
@@ -242,7 +256,7 @@ class TextCNN(Layer):
       pooled_outputs.append(pooled)
     net = self.concat_layer(pooled_outputs)
     if self.mlp is not None:
-      output = self.mlp(net)
+      output = self.mlp(net, training=training)
     else:
       output = net
     return output
